@@ -27,6 +27,7 @@ export interface Enemy {
   kind: EnemyKind;
   x: number;
   z: number;
+  height: number;
   health: number;
   maxHealth: number;
   attackTimer: number;

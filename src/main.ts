@@ -24,7 +24,7 @@ class VoxelSiege {
   private grid = new THREE.GridHelper(TUNING.gridWidth, TUNING.gridWidth, 0x73777e, 0x42464d);
   private structures = new Map<string, Structure>();
   private enemies: Enemy[] = [];
-  private debris = new Map<number, { structure: Structure; body: RAPIER.RigidBody }>();
+  private debris = new Map<number, { structure: Structure; body: RAPIER.RigidBody; settleTime: number }>();
   private projectiles: Array<{ mesh: THREE.Mesh; from: THREE.Vector3; to: THREE.Vector3; life: number; maxLife: number; damage: number; targetId: number; splash: boolean }> = [];
   private structureMeshes = new Map<number, THREE.Object3D>();
   private nextId = 1;
@@ -443,7 +443,7 @@ class VoxelSiege {
     group.position.set(x, 0, z);
     this.scene.add(group);
     const health = kind === 'bomber' ? 30 : kind === 'ladder' ? 48 : TUNING.enemyHealth;
-    this.enemies.push({ id: this.nextId++, kind, x, z, health, maxHealth: health, attackTimer: 0, ladderTimer: 0, path: [], pathIndex: 0, mesh: group });
+    this.enemies.push({ id: this.nextId++, kind, x, z, height: 0, health, maxHealth: health, attackTimer: 0, ladderTimer: 0, path: [], pathIndex: 0, mesh: group });
   }
 
   private updateEnemy(enemy: Enemy, dt: number) {
@@ -455,7 +455,13 @@ class VoxelSiege {
       const next = path[0];
       const dx = next.x - enemy.x, dz = next.z - enemy.z;
       const distance = Math.hypot(dx, dz);
-      if (distance < 0.24) { enemy.x = next.x; enemy.z = next.z; }
+      const obstacle = this.structures.get(structureKey(next.x, 0, next.z));
+      if (enemy.kind === 'ladder' && obstacle && obstacle.kind !== 'throne' && distance < 0.24) {
+        enemy.ladderTimer += dt;
+        if (enemy.ladderTimer >= 1.15) { enemy.x = next.x; enemy.z = next.z; enemy.ladderTimer = 0; enemy.height = 0; }
+        else enemy.height = 1.35 * Math.sin((enemy.ladderTimer / 1.15) * Math.PI);
+      }
+      else if (distance < 0.24) { enemy.x = next.x; enemy.z = next.z; enemy.height = 0; }
       else { enemy.x += dx / distance * TUNING.enemySpeed * dt; enemy.z += dz / distance * TUNING.enemySpeed * dt; }
       enemy.path = path;
     } else {
@@ -468,7 +474,7 @@ class VoxelSiege {
       if (this.coreHealth <= 0) { this.coreHealth = 0; this.phase = 'defeat'; this.showDefeat(); }
       this.syncUi();
     }
-    if (enemy.mesh) { enemy.mesh.position.set(enemy.x, 0, enemy.z); enemy.mesh.rotation.y = Math.atan2(this.core.cell.x - enemy.x, this.core.cell.z - enemy.z); }
+    if (enemy.mesh) { enemy.mesh.position.set(enemy.x, enemy.height, enemy.z); enemy.mesh.rotation.y = Math.atan2(this.core.cell.x - enemy.x, this.core.cell.z - enemy.z); }
   }
 
   private findPath(start: GridPos, kind: EnemyKind): GridPos[] {
@@ -550,7 +556,7 @@ class VoxelSiege {
     this.physics.createCollider(RAPIER.ColliderDesc.cuboid(0.45, 0.45, 0.45).setFriction(0.85), body);
     item.mesh = this.createStructureMesh(item);
     this.scene.add(item.mesh);
-    this.debris.set(item.id, { structure: item, body });
+    this.debris.set(item.id, { structure: item, body, settleTime: 0 });
   }
 
   private updateTowers(dt: number) {
@@ -607,8 +613,9 @@ class VoxelSiege {
         item.structure.mesh.position.set(pos.x, pos.y, pos.z);
         item.structure.mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
       }
-      const settled = pos.y <= 0.51 && Math.abs(item.body.linvel().y) < 0.32;
-      if (!settled) continue;
+      const isSettled = pos.y <= 0.51 && Math.abs(item.body.linvel().y) < 0.32;
+      item.settleTime = isSettled ? item.settleTime + dt : 0;
+      if (item.settleTime < TUNING.rubbleSettledSeconds) continue;
       const x = clamp(Math.round(pos.x), -GRID_HALF + 1, GRID_HALF - 1);
       const z = clamp(Math.round(pos.z), -GRID_HALF + 1, GRID_HALF - 1);
       let y = 0;
