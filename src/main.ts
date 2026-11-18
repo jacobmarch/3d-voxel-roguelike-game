@@ -95,16 +95,16 @@ class VoxelSiege {
           <div class="overlay" id="overlay" style="display:none"><div class="modal panel"><h1>Run over</h1><p>The throne has fallen. Your next run will begin with a fresh map and 100 gold.</p><div class="wave-count" id="final-wave">Wave 01 reached</div><div style="height:18px"></div><button class="primary" id="restart">Start new run</button></div></div>
         </div>
       </main>`;
-    this.ui.gold = document.querySelector('#gold-value')!;
-    this.ui.wave = document.querySelector('#wave-value')!;
-    this.ui.phase = document.querySelector('#phase-text')!;
-    this.ui.health = document.querySelector('#health-value')!;
+    this.ui.gold = document.querySelector<HTMLElement>('#gold-value')!;
+    this.ui.wave = document.querySelector<HTMLElement>('#wave-value')!;
+    this.ui.phase = document.querySelector<HTMLElement>('#phase-text')!;
+    this.ui.health = document.querySelector<HTMLElement>('#health-value')!;
     this.ui.start = document.querySelector<HTMLButtonElement>('#start-wave')!;
-    this.ui.hint = document.querySelector('#action-caption')!;
-    this.ui.toast = document.querySelector('#toast')!;
-    this.ui.rubble = document.querySelector('#rubble-status')!;
-    this.ui.overlay = document.querySelector('#overlay')!;
-    this.ui.panel = document.querySelector('#build-panel')!;
+    this.ui.hint = document.querySelector<HTMLElement>('#action-caption')!;
+    this.ui.toast = document.querySelector<HTMLElement>('#toast')!;
+    this.ui.rubble = document.querySelector<HTMLElement>('#rubble-status')!;
+    this.ui.overlay = document.querySelector<HTMLElement>('#overlay')!;
+    this.ui.panel = document.querySelector<HTMLElement>('#build-panel')!;
     this.ui.start.addEventListener('click', () => this.beginWave());
     document.querySelector('#restart')?.addEventListener('click', () => this.restart());
     this.renderBuildPanel();
