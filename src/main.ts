@@ -19,6 +19,7 @@ class VoxelSiege {
   private controls!: OrbitControls;
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
+  private pointerStart: { x: number; y: number } | null = null;
   private ground = new THREE.Mesh(new THREE.PlaneGeometry(TUNING.gridWidth, TUNING.gridWidth), new THREE.MeshStandardMaterial({ color: 0x202226, roughness: 1 }));
   private grid = new THREE.GridHelper(TUNING.gridWidth, TUNING.gridWidth, 0x73777e, 0x42464d);
   private structures = new Map<string, Structure>();
@@ -180,7 +181,10 @@ class VoxelSiege {
 
   private installEvents() {
     this.renderer.domElement.addEventListener('pointermove', this.onPointerMove);
-    this.renderer.domElement.addEventListener('pointerdown', this.onPointerDown);
+    this.renderer.domElement.addEventListener('pointerdown', (event) => {
+      this.pointerStart = event.button === 0 ? { x: event.clientX, y: event.clientY } : null;
+    });
+    this.renderer.domElement.addEventListener('pointerup', this.onPointerUp);
     window.addEventListener('keydown', this.onKeyDown);
     this.renderer.domElement.addEventListener('contextmenu', (event) => event.preventDefault());
   }
@@ -212,8 +216,10 @@ class VoxelSiege {
     (this.preview.material as THREE.MeshBasicMaterial).opacity = occupied ? 0.1 : 0.36;
   };
 
-  private onPointerDown = (event: PointerEvent) => {
-    if (event.button !== 0 || this.phase === 'wave' || this.phase === 'defeat') return;
+  private onPointerUp = (event: PointerEvent) => {
+    const start = this.pointerStart;
+    this.pointerStart = null;
+    if (event.button !== 0 || !start || Math.hypot(event.clientX - start.x, event.clientY - start.y) > 5 || this.phase === 'wave' || this.phase === 'defeat') return;
     const hit = this.getGridHit(event);
     if (!hit || !this.isInsideGrid(hit.x, hit.z)) return;
     if (this.phase === 'place-throne') { this.placeThrone(hit); return; }
