@@ -31,4 +31,9 @@ Prototype costs, durability, enemy behavior, wave counts, damage, and timing are
 - Red grunt, ladder squad, and bomber enemies.
 - Structural grid state is authoritative; Rapier handles falling-block motion.
 - Upgrades and player-editable game data are outside the first slice.
+- Reload persistence is not included in this first prototype slice.
+
+## Prototype limits
+
+Grid size, enemy routing, health, prices, wave composition, and combat timings are initial implementation values. Adjust them in `src/config.ts` during playtesting; they are not intended as final balance.
 

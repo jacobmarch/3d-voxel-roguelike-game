@@ -5,6 +5,8 @@
 export const TUNING = {
   gridWidth: 28,
   startingGold: 100,
+  coreHealth: 100,
+  towerHealth: 38,
   goldPerGrunt: 3,
   goldPerLadderSquad: 8,
   goldPerBomber: 10,
@@ -29,6 +31,10 @@ export const TUNING = {
   blockHealth: { wood: 20, stone: 70, steel: 130 },
   towerCosts: { single: 18, splash: 24 },
   waveGoldBonus: 14,
+  ladderUnlockWave: 2,
+  bomberUnlockWave: 3,
+  ladderWaveChance: 0.28,
+  bomberWaveChance: 0.22,
 } as const;
 
 export const GRID_HALF = Math.floor(TUNING.gridWidth / 2);

@@ -28,13 +28,15 @@ class VoxelSiege {
   private projectiles: Array<{ mesh: THREE.Mesh; from: THREE.Vector3; to: THREE.Vector3; life: number; maxLife: number; damage: number; targetId: number; splash: boolean }> = [];
   private structureMeshes = new Map<number, THREE.Object3D>();
   private nextId = 1;
+  private layoutVersion = 0;
+  private routeCache = new Map<string, GridPos[]>();
   private phase: Phase = 'place-throne';
   private selected: PlaceKind = 'wood';
   private selectedRubble: Structure | null = null;
   private core: Structure | null = null;
   private gold = TUNING.startingGold;
   private wave = 1;
-  private coreHealth = 100;
+  private coreHealth = TUNING.coreHealth;
   private spawnRemaining = 0;
   private spawnTimer = 0;
   private towerTimers = new Map<number, number>();
@@ -295,7 +297,7 @@ class VoxelSiege {
     if (this.gold < price) return this.showToast('Not enough gold.');
     this.gold -= price;
     const isTower = kind === 'single' || kind === 'splash';
-    const hp = isTower ? 38 : TUNING.blockHealth[kind as MaterialKind];
+    const hp = isTower ? TUNING.towerHealth : TUNING.blockHealth[kind as MaterialKind];
     const item: Structure = { id: this.nextId++, kind, cell: { ...cell }, health: hp, maxHealth: hp, rubble: false };
     this.addStructure(item);
     this.syncUi();
@@ -312,6 +314,8 @@ class VoxelSiege {
     this.structures.delete(structureKey(piece.cell.x, piece.cell.y, piece.cell.z));
     piece.cell = dest;
     this.structures.set(structureKey(dest.x, dest.y, dest.z), piece);
+    this.layoutVersion++;
+    this.routeCache.clear();
     if (piece.mesh) piece.mesh.position.set(dest.x, dest.y + 0.5, dest.z);
     this.selectedRubble = null;
     this.showToast('Rubble moved and reused.');
@@ -330,6 +334,8 @@ class VoxelSiege {
     this.structures.set(structureKey(item.cell.x, item.cell.y, item.cell.z), item);
     this.structureMeshes.set(item.id, mesh);
     this.scene.add(mesh);
+    this.layoutVersion++;
+    this.routeCache.clear();
   }
 
   private createStructureMesh(item: Structure) {
@@ -392,7 +398,8 @@ class VoxelSiege {
     for (const piece of this.debris.values()) this.physics.removeRigidBody(piece.body);
     for (const projectile of this.projectiles) this.scene.remove(projectile.mesh);
     this.structures.clear(); this.structureMeshes.clear(); this.enemies = []; this.debris.clear(); this.projectiles = [];
-    this.core = null; this.gold = TUNING.startingGold; this.wave = 1; this.coreHealth = 100; this.nextId = 1; this.phase = 'place-throne'; this.selectedRubble = null;
+    this.routeCache.clear(); this.layoutVersion++;
+    this.core = null; this.gold = TUNING.startingGold; this.wave = 1; this.coreHealth = TUNING.coreHealth; this.nextId = 1; this.phase = 'place-throne'; this.selectedRubble = null;
     this.ui.overlay!.style.display = 'none';
     this.showToast('New run. Place your throne anywhere on the grid.');
     this.syncUi();
@@ -417,8 +424,8 @@ class VoxelSiege {
 
   private nextEnemyKind(): EnemyKind {
     // TUNING - wave unlocks and mix are provisional playtest values.
-    if (this.wave >= 3 && Math.random() < 0.22) return 'bomber';
-    if (this.wave >= 2 && Math.random() < 0.28) return 'ladder';
+    if (this.wave >= TUNING.bomberUnlockWave && Math.random() < TUNING.bomberWaveChance) return 'bomber';
+    if (this.wave >= TUNING.ladderUnlockWave && Math.random() < TUNING.ladderWaveChance) return 'ladder';
     return 'grunt';
   }
 
@@ -465,10 +472,10 @@ class VoxelSiege {
       else { enemy.x += dx / distance * TUNING.enemySpeed * dt; enemy.z += dz / distance * TUNING.enemySpeed * dt; }
       enemy.path = path;
     } else {
-      this.attackBlockingStructure(enemy, dt);
+      this.approachBlockingStructure(enemy, dt);
     }
     const goalDist = Math.hypot(enemy.x - this.core.cell.x, enemy.z - this.core.cell.z);
-    if (goalDist < 1.0 && enemy.attackTimer <= 0) {
+    if (goalDist <= 1.2 && enemy.attackTimer <= 0) {
       this.coreHealth -= enemy.kind === 'bomber' ? 12 : 7;
       enemy.attackTimer = 0.75;
       if (this.coreHealth <= 0) { this.coreHealth = 0; this.phase = 'defeat'; this.showDefeat(); }
@@ -479,13 +486,18 @@ class VoxelSiege {
 
   private findPath(start: GridPos, kind: EnemyKind): GridPos[] {
     if (!this.core) return [];
+    const startPos = { x: clamp(Math.round(start.x), -GRID_HALF + 1, GRID_HALF - 1), z: clamp(Math.round(start.z), -GRID_HALF + 1, GRID_HALF - 1) };
+    const startKey = floorKey(startPos.x, startPos.z);
+    const cacheKey = `${kind}:${startKey}:${this.core.cell.x},${this.core.cell.z}:${this.layoutVersion}`;
+    const cached = this.routeCache.get(cacheKey);
+    if (cached) return cached;
     const goals: GridPos[] = [
       { x: this.core.cell.x + 1, z: this.core.cell.z }, { x: this.core.cell.x - 1, z: this.core.cell.z },
       { x: this.core.cell.x, z: this.core.cell.z + 1 }, { x: this.core.cell.x, z: this.core.cell.z - 1 },
     ].filter((p) => this.isInsideGrid(p.x, p.z));
-    const queue: GridPos[] = [{ x: clamp(Math.round(start.x), -GRID_HALF + 1, GRID_HALF - 1), z: clamp(Math.round(start.z), -GRID_HALF + 1, GRID_HALF - 1) }];
+    const queue: GridPos[] = [startPos];
     const previous = new Map<string, string | null>();
-    previous.set(floorKey(queue[0].x, queue[0].z), null);
+    previous.set(startKey, null);
     let goalKey: string | null = null;
     const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
     while (queue.length) {
@@ -495,26 +507,26 @@ class VoxelSiege {
       for (const [dx, dz] of dirs) {
         const nx = p.x + dx, nz = p.z + dz, nk = floorKey(nx, nz);
         if (!this.isInsideGrid(nx, nz) || previous.has(nk)) continue;
-        const obstacle = this.structures.get(structureKey(nx, 0, nz));
-        if (obstacle && !(kind === 'ladder' && obstacle.kind !== 'throne')) continue;
+        const obstacle = this.getWallAt(nx, nz);
+        if (obstacle && kind !== 'ladder') continue;
         previous.set(nk, key); queue.push({ x: nx, z: nz });
       }
     }
-    if (!goalKey) return [];
+    if (!goalKey) { this.routeCache.set(cacheKey, []); return []; }
     const result: GridPos[] = [];
     let cursor: string | null = goalKey;
-    const startKey = floorKey(queue[0]?.x ?? Math.round(start.x), queue[0]?.z ?? Math.round(start.z));
     while (cursor && cursor !== startKey) {
       const [x, z] = cursor.split(',').map(Number);
       result.unshift({ x, z });
       cursor = previous.get(cursor) ?? null;
     }
+    this.routeCache.set(cacheKey, result);
     return result;
   }
 
   private attackBlockingStructure(enemy: Enemy, dt: number) {
     if (enemy.attackTimer > 0) return;
-    const candidates = [...this.structures.values()].filter((item) => item.kind !== 'throne' && item.cell.y === 0 && Math.hypot(item.cell.x - enemy.x, item.cell.z - enemy.z) < 1.6);
+    const candidates = [...this.structures.values()].filter((item) => this.isMaterial(item.kind) && item.cell.y === 0 && Math.hypot(item.cell.x - enemy.x, item.cell.z - enemy.z) < 1.6);
     if (!candidates.length) return;
     const target = candidates.sort((a, b) => Math.hypot(a.cell.x - enemy.x, a.cell.z - enemy.z) - Math.hypot(b.cell.x - enemy.x, b.cell.z - enemy.z))[0];
     if (enemy.kind === 'grunt' && target.kind !== 'wood') { enemy.attackTimer = 0.5; return; }
@@ -531,6 +543,29 @@ class VoxelSiege {
     if (target.health <= 0) this.destroyStructure(target);
   }
 
+  private approachBlockingStructure(enemy: Enemy, dt: number) {
+    const blockers = [...this.structures.values()].filter((item) => this.isMaterial(item.kind) && item.cell.y === 0 && Math.hypot(item.cell.x - enemy.x, item.cell.z - enemy.z) < Math.hypot(this.core!.cell.x - enemy.x, this.core!.cell.z - enemy.z));
+    if (!blockers.length) return;
+    const target = blockers.sort((a, b) => Math.hypot(a.cell.x - enemy.x, a.cell.z - enemy.z) - Math.hypot(b.cell.x - enemy.x, b.cell.z - enemy.z))[0];
+    const dx = target.cell.x - enemy.x, dz = target.cell.z - enemy.z;
+    const distance = Math.hypot(dx, dz);
+    if (distance > 1.12) {
+      enemy.x += dx / distance * TUNING.enemySpeed * dt;
+      enemy.z += dz / distance * TUNING.enemySpeed * dt;
+    } else {
+      this.attackBlockingStructure(enemy, dt);
+    }
+  }
+
+  private getWallAt(x: number, z: number) {
+    const groundBlock = this.structures.get(structureKey(x, 0, z));
+    return groundBlock && this.isMaterial(groundBlock.kind) ? groundBlock : undefined;
+  }
+
+  private isMaterial(kind: string): kind is MaterialKind {
+    return kind === 'wood' || kind === 'stone' || kind === 'steel';
+  }
+
   private applyBlast(cell: Cell, damage: number) {
     const affected = [...this.structures.values()].filter((item) => Math.hypot(item.cell.x - cell.x, item.cell.z - cell.z) <= 1.5 && item.kind !== 'throne' && item.kind !== 'steel');
     for (const item of affected) { item.health -= damage; if (item.health <= 0) this.destroyStructure(item); }
@@ -538,6 +573,8 @@ class VoxelSiege {
 
   private destroyStructure(item: Structure) {
     this.structures.delete(structureKey(item.cell.x, item.cell.y, item.cell.z));
+    this.layoutVersion++;
+    this.routeCache.clear();
     this.structureMeshes.delete(item.id);
     if (item.mesh) this.scene.remove(item.mesh);
     for (let y = item.cell.y + 1; y < 32; y++) {
@@ -630,6 +667,8 @@ class VoxelSiege {
       this.scene.add(item.structure.mesh);
       this.structures.set(structureKey(x, y, z), item.structure);
       this.structureMeshes.set(id, item.structure.mesh);
+      this.layoutVersion++;
+      this.routeCache.clear();
       this.physics.removeRigidBody(item.body);
       this.debris.delete(id);
       this.syncUi();
