@@ -28,13 +28,15 @@ export interface Enemy {
   x: number;
   z: number;
   height: number;
+  previousX: number;
+  previousZ: number;
+  previousHeight: number;
   health: number;
   maxHealth: number;
   attackTimer: number;
   ladderTimer: number;
   path: GridPos[];
   pathIndex: number;
-  mesh?: import('three').Group;
 }
 
 export type Phase = 'place-throne' | 'build' | 'wave' | 'defeat';

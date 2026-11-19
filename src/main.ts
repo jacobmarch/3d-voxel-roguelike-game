@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import RAPIER from '@dimforge/rapier3d-compat';
 import './style.css';
 import { GRID_HALF, TUNING } from './config';
+import { loadSavedRun, saveRun, type SavedRun } from './save/storage';
 import type { Cell, Enemy, EnemyKind, GridPos, MaterialKind, Phase, PlaceKind, Structure, TowerKind } from './types';
 
 const app = document.querySelector<HTMLDivElement>('#app');
@@ -11,6 +12,31 @@ if (!app) throw new Error('App root was not found');
 const structureKey = (x: number, y: number, z: number) => `${x},${y},${z}`;
 const floorKey = (x: number, z: number) => `${x},${z}`;
 const clamp = (v: number, low: number, high: number) => Math.max(low, Math.min(high, v));
+const SIMULATION_STEP = 1 / 60;
+const MAX_FRAME_DELTA = 0.1;
+
+function createRunSeed() {
+  const seedQuery = new URLSearchParams(window.location.search).get('seed');
+  if (seedQuery !== null && /^\d+$/.test(seedQuery)) return Number(seedQuery) >>> 0;
+  if (typeof crypto !== 'undefined' && 'getRandomValues' in crypto) return crypto.getRandomValues(new Uint32Array(1))[0];
+  return Math.floor(Math.random() * 0x1_0000_0000) >>> 0;
+}
+
+class SeededRandom {
+  private state: number;
+
+  constructor(seed: number) {
+    this.state = seed >>> 0 || 0x6d2b79f5;
+  }
+
+  next() {
+    // Mulberry32: a small, deterministic generator suitable for wave composition and spawn positions.
+    let value = this.state += 0x6d2b79f5;
+    value = Math.imul(value ^ value >>> 15, value | 1);
+    value ^= value + Math.imul(value ^ value >>> 7, value | 61);
+    return ((value ^ value >>> 14) >>> 0) / 0x1_0000_0000;
+  }
+}
 
 class VoxelSiege {
   private scene = new THREE.Scene();
@@ -24,9 +50,13 @@ class VoxelSiege {
   private grid = new THREE.GridHelper(TUNING.gridWidth, TUNING.gridWidth, 0x73777e, 0x42464d);
   private structures = new Map<string, Structure>();
   private enemies: Enemy[] = [];
+  private enemyMeshes = new Map<number, THREE.Group>();
   private debris = new Map<number, { structure: Structure; body: RAPIER.RigidBody; settleTime: number }>();
   private projectiles: Array<{ mesh: THREE.Mesh; from: THREE.Vector3; to: THREE.Vector3; life: number; maxLife: number; damage: number; targetId: number; splash: boolean }> = [];
   private structureMeshes = new Map<number, THREE.Object3D>();
+  private materialBatches = new Map<MaterialKind, THREE.InstancedMesh>();
+  private batchStructures = new Map<THREE.InstancedMesh, Structure[]>();
+  private structureInstances = new Map<number, { mesh: THREE.InstancedMesh; index: number }>();
   private nextId = 1;
   private layoutVersion = 0;
   private routeCache = new Map<string, GridPos[]>();
@@ -34,17 +64,21 @@ class VoxelSiege {
   private selected: PlaceKind = 'wood';
   private selectedRubble: Structure | null = null;
   private core: Structure | null = null;
-  private gold = TUNING.startingGold;
+  private gold: number = TUNING.startingGold;
   private wave = 1;
-  private coreHealth = TUNING.coreHealth;
+  private coreHealth: number = TUNING.coreHealth;
+  private runSeed = createRunSeed();
+  private random = new SeededRandom(this.runSeed);
   private spawnRemaining = 0;
   private spawnTimer = 0;
   private towerTimers = new Map<number, number>();
   private physics!: RAPIER.World;
   private preview?: THREE.Mesh;
   private lastFrame = performance.now();
+  private simulationAccumulator = 0;
   private elapsed = 0;
   private toastTimer?: number;
+  private persistenceWarningShown = false;
   private ui = {
     gold: undefined as HTMLElement | undefined,
     wave: undefined as HTMLElement | undefined,
@@ -66,6 +100,17 @@ class VoxelSiege {
     this.mountScene();
     this.installEvents();
     this.syncUi();
+    try {
+      const savedRun = await loadSavedRun();
+      if (savedRun) {
+        this.restoreSavedRun(savedRun);
+        this.showToast('Saved run restored.');
+      }
+    } catch (error) {
+      console.warn('Local run storage is unavailable.', error);
+      this.showToast('Local saving is unavailable in this browser session.');
+    }
+    this.syncUi();
     this.animate();
   }
 
@@ -75,7 +120,7 @@ class VoxelSiege {
         <div class="scene" id="scene"></div>
         <div class="hud">
           <header class="topbar">
-            <div class="brand"><div class="brand-mark">V</div><div><div class="brand-title">Voxel Siege</div><div class="brand-sub">Prototype � Run ${'-'}</div></div></div>
+            <div class="brand"><div class="brand-mark">V</div><div><div class="brand-title">Voxel Siege</div><div class="brand-sub" id="run-seed">Prototype</div></div></div>
             <div class="run-status"><span class="status-dot" id="phase-dot"></span><span id="phase-text">Place the core</span></div>
             <div class="top-right">
               <div class="stat"><div class="stat-label">Wave</div><div class="stat-value" id="wave-value">01</div></div>
@@ -105,6 +150,7 @@ class VoxelSiege {
     this.ui.rubble = document.querySelector<HTMLElement>('#rubble-status')!;
     this.ui.overlay = document.querySelector<HTMLElement>('#overlay')!;
     this.ui.panel = document.querySelector<HTMLElement>('#build-panel')!;
+    document.querySelector<HTMLElement>('#run-seed')!.textContent = `Run seed ${this.runSeed}`;
     this.ui.start.addEventListener('click', () => this.beginWave());
     document.querySelector('#restart')?.addEventListener('click', () => this.restart());
     this.renderBuildPanel();
@@ -189,6 +235,7 @@ class VoxelSiege {
     this.renderer.domElement.addEventListener('pointerup', this.onPointerUp);
     window.addEventListener('keydown', this.onKeyDown);
     this.renderer.domElement.addEventListener('contextmenu', (event) => event.preventDefault());
+    window.addEventListener('pagehide', () => this.saveCheckpoint());
   }
 
   private onResize = () => {
@@ -240,13 +287,13 @@ class VoxelSiege {
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
     this.raycaster.setFromCamera(this.pointer, this.camera);
-    const targets = [...this.structureMeshes.values(), this.ground];
+    const targets = [...new Set(this.structureMeshes.values()), this.ground];
     const hit = this.raycaster.intersectObjects(targets, false)[0];
     if (!hit) return null;
     let x = Math.round(hit.point.x);
     let z = Math.round(hit.point.z);
     let y = 0;
-    const structure = this.structureForObject(hit.object);
+    const structure = this.structureForObject(hit.object, hit.instanceId);
     if (structure && hit.face) {
       const normal = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
       if (normal.y > 0.55) y = structure.cell.y + 1;
@@ -260,11 +307,12 @@ class VoxelSiege {
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.pointer.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
     this.raycaster.setFromCamera(this.pointer, this.camera);
-    const hit = this.raycaster.intersectObjects([...this.structureMeshes.values()], false)[0];
-    return hit ? this.structureForObject(hit.object) : null;
+    const hit = this.raycaster.intersectObjects([...new Set(this.structureMeshes.values())], false)[0];
+    return hit ? this.structureForObject(hit.object, hit.instanceId) : null;
   }
 
-  private structureForObject(object: THREE.Object3D) {
+  private structureForObject(object: THREE.Object3D, instanceId?: number) {
+    if (object instanceof THREE.InstancedMesh && instanceId !== undefined) return this.batchStructures.get(object)?.[instanceId] ?? null;
     let current: THREE.Object3D | null = object;
     while (current && current !== this.scene) {
       const found = [...this.structures.values()].find((item) => item.mesh === current);
@@ -285,6 +333,7 @@ class VoxelSiege {
     this.phase = 'build';
     this.showToast('Throne placed. Build your first defense.');
     this.syncUi();
+    this.saveCheckpoint();
   }
 
   private placeSelected(cell: Cell) {
@@ -301,6 +350,7 @@ class VoxelSiege {
     const item: Structure = { id: this.nextId++, kind, cell: { ...cell }, health: hp, maxHealth: hp, rubble: false };
     this.addStructure(item);
     this.syncUi();
+    this.saveCheckpoint();
   }
 
   private moveRubble(target: Cell) {
@@ -317,9 +367,11 @@ class VoxelSiege {
     this.layoutVersion++;
     this.routeCache.clear();
     if (piece.mesh) piece.mesh.position.set(dest.x, dest.y + 0.5, dest.z);
+    const fallen = this.dropUnsupportedStructures();
     this.selectedRubble = null;
-    this.showToast('Rubble moved and reused.');
+    this.showToast(fallen ? `Rubble moved. ${fallen} unsupported ${fallen === 1 ? 'block fell' : 'blocks fell'}.` : 'Rubble moved and reused.');
     this.syncUi();
+    this.saveCheckpoint();
   }
 
   private priceFor(kind: PlaceKind) {
@@ -328,12 +380,17 @@ class VoxelSiege {
     return 0;
   }
 
-  private addStructure(item: Structure) {
-    const mesh = this.createStructureMesh(item);
-    item.mesh = mesh;
+  private addStructure(item: Structure, rebuildBatch = true) {
     this.structures.set(structureKey(item.cell.x, item.cell.y, item.cell.z), item);
-    this.structureMeshes.set(item.id, mesh);
-    this.scene.add(mesh);
+    if (this.isMaterial(item.kind)) {
+      item.mesh = undefined;
+      if (rebuildBatch) this.rebuildMaterialBatches();
+    } else {
+      const mesh = this.createStructureMesh(item);
+      item.mesh = mesh;
+      this.structureMeshes.set(item.id, mesh);
+      this.scene.add(mesh);
+    }
     this.layoutVersion++;
     this.routeCache.clear();
   }
@@ -360,6 +417,67 @@ class VoxelSiege {
       group.add(marker);
     }
     return group;
+  }
+
+  private rebuildMaterialBatches() {
+    for (const [mesh, items] of this.batchStructures) {
+      this.scene.remove(mesh);
+      mesh.geometry.dispose();
+      (mesh.material as THREE.Material).dispose();
+      for (const item of items) {
+        this.structureMeshes.delete(item.id);
+        this.structureInstances.delete(item.id);
+      }
+    }
+    this.materialBatches.clear();
+    this.batchStructures.clear();
+
+    for (const kind of ['wood', 'stone', 'steel'] satisfies MaterialKind[]) {
+      const items = [...this.structures.values()].filter((item) => item.kind === kind);
+      if (!items.length) continue;
+      const colors: Record<MaterialKind, number> = { wood: 0x77736e, stone: 0x92969b, steel: 0xc0c4ca };
+      const baseMaterial = new THREE.MeshStandardMaterial({ color: colors[kind], roughness: kind === 'steel' ? 0.36 : 0.86, metalness: kind === 'steel' ? 0.65 : 0.05 });
+      const batch = new THREE.InstancedMesh(new THREE.BoxGeometry(0.92, 0.92, 0.92), baseMaterial, items.length);
+      batch.name = `${kind}-blocks`;
+      batch.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      for (let index = 0; index < items.length; index++) {
+        const item = items[index];
+        const transform = new THREE.Object3D();
+        transform.position.set(item.cell.x, item.cell.y + 0.5, item.cell.z);
+        transform.updateMatrix();
+        batch.setMatrixAt(index, transform.matrix);
+        batch.setColorAt(index, this.damageTint(item));
+        this.structureMeshes.set(item.id, batch);
+        this.structureInstances.set(item.id, { mesh: batch, index });
+      }
+      batch.instanceMatrix.needsUpdate = true;
+      if (batch.instanceColor) batch.instanceColor.needsUpdate = true;
+      batch.computeBoundingSphere();
+      this.scene.add(batch);
+      this.materialBatches.set(kind, batch);
+      this.batchStructures.set(batch, items);
+    }
+  }
+
+  private damageTint(item: Structure) {
+    const damage = 1 - clamp(item.health / item.maxHealth, 0, 1);
+    return new THREE.Color(0xffffff).lerp(new THREE.Color(0xc83232), damage * 0.72);
+  }
+
+  private refreshStructureDamage(item: Structure) {
+    const instance = this.structureInstances.get(item.id);
+    if (instance) {
+      instance.mesh.setColorAt(instance.index, this.damageTint(item));
+      if (instance.mesh.instanceColor) instance.mesh.instanceColor.needsUpdate = true;
+      return;
+    }
+    const body = item.mesh?.children[0];
+    if (!(body instanceof THREE.Mesh)) return;
+    const material = body.material;
+    if (material instanceof THREE.MeshStandardMaterial) {
+      const base = item.kind === 'throne' ? 0xb7b8bb : 0x367ce5;
+      material.color.setHex(base).lerp(new THREE.Color(0xc83232), (1 - clamp(item.health / item.maxHealth, 0, 1)) * 0.72);
+    }
   }
 
   private renderBuildPanel() {
@@ -394,15 +512,87 @@ class VoxelSiege {
 
   private restart() {
     for (const structure of this.structures.values()) if (structure.mesh) this.scene.remove(structure.mesh);
-    for (const enemy of this.enemies) if (enemy.mesh) this.scene.remove(enemy.mesh);
+    for (const batch of this.materialBatches.values()) {
+      this.scene.remove(batch);
+      batch.geometry.dispose();
+      (batch.material as THREE.Material).dispose();
+    }
+    this.materialBatches.clear();
+    this.batchStructures.clear();
+    this.structureInstances.clear();
+    for (const mesh of this.enemyMeshes.values()) this.scene.remove(mesh);
     for (const piece of this.debris.values()) this.physics.removeRigidBody(piece.body);
     for (const projectile of this.projectiles) this.scene.remove(projectile.mesh);
-    this.structures.clear(); this.structureMeshes.clear(); this.enemies = []; this.debris.clear(); this.projectiles = [];
+    this.structures.clear(); this.structureMeshes.clear(); this.enemies = []; this.enemyMeshes.clear(); this.debris.clear(); this.projectiles = [];
+    this.towerTimers.clear();
     this.routeCache.clear(); this.layoutVersion++;
-    this.core = null; this.gold = TUNING.startingGold; this.wave = 1; this.coreHealth = TUNING.coreHealth; this.nextId = 1; this.phase = 'place-throne'; this.selectedRubble = null;
+    this.core = null; this.gold = TUNING.startingGold; this.wave = 1; this.coreHealth = TUNING.coreHealth; this.nextId = 1; this.phase = 'place-throne'; this.selectedRubble = null; this.selected = 'wood'; this.spawnRemaining = 0; this.spawnTimer = 0;
+    this.runSeed = createRunSeed();
+    this.random = new SeededRandom(this.runSeed);
+    document.querySelector<HTMLElement>('#run-seed')!.textContent = `Run seed ${this.runSeed}`;
     this.ui.overlay!.style.display = 'none';
+    this.renderBuildPanel();
     this.showToast('New run. Place your throne anywhere on the grid.');
     this.syncUi();
+    this.saveCheckpoint();
+  }
+
+  private restoreSavedRun(saved: SavedRun) {
+    this.runSeed = saved.seed;
+    this.random = new SeededRandom(saved.seed);
+    this.phase = saved.phase;
+    this.gold = saved.gold;
+    this.wave = saved.wave;
+    this.coreHealth = saved.coreHealth;
+    this.core = null;
+    this.nextId = 1;
+    this.structures.clear();
+    this.structureMeshes.clear();
+    this.routeCache.clear();
+    this.layoutVersion++;
+    for (const savedStructure of saved.structures) {
+      const item: Structure = { ...savedStructure, cell: { ...savedStructure.cell } };
+      if (item.kind === 'throne') {
+        this.core = item;
+        item.health = this.coreHealth;
+      }
+      this.nextId = Math.max(this.nextId, item.id + 1);
+      this.addStructure(item, false);
+    }
+    this.rebuildMaterialBatches();
+    document.querySelector<HTMLElement>('#run-seed')!.textContent = `Run seed ${this.runSeed}`;
+    this.ui.overlay!.style.display = this.phase === 'defeat' ? 'grid' : 'none';
+    if (this.phase === 'defeat') {
+      document.querySelector<HTMLElement>('#final-wave')!.textContent = `Wave ${String(this.wave).padStart(2, '0')} reached`;
+    }
+  }
+
+  private saveCheckpoint() {
+    if (this.phase === 'wave') return;
+    const saved: SavedRun = {
+      schemaVersion: 1,
+      seed: this.runSeed,
+      phase: this.phase,
+      gold: this.gold,
+      wave: this.wave,
+      coreHealth: this.coreHealth,
+      structures: [...this.structures.values()].map((item) => ({
+        id: item.id,
+        kind: item.kind,
+        cell: { ...item.cell },
+        health: item.health,
+        maxHealth: item.maxHealth,
+        rubble: item.rubble,
+      })),
+      settings: {},
+    };
+    void saveRun(saved).catch((error) => {
+      if (!this.persistenceWarningShown) {
+        this.persistenceWarningShown = true;
+        this.showToast('Could not save locally. Your run may not survive a reload.');
+      }
+      console.warn('Failed to save the local run.', error);
+    });
   }
 
   private updateWave(dt: number) {
@@ -419,20 +609,21 @@ class VoxelSiege {
       this.wave++;
       this.showToast(`Wave cleared. +${TUNING.waveGoldBonus} gold. Move rubble and rebuild.`);
       this.syncUi();
+      this.saveCheckpoint();
     }
   }
 
   private nextEnemyKind(): EnemyKind {
     // TUNING - wave unlocks and mix are provisional playtest values.
-    if (this.wave >= TUNING.bomberUnlockWave && Math.random() < TUNING.bomberWaveChance) return 'bomber';
-    if (this.wave >= TUNING.ladderUnlockWave && Math.random() < TUNING.ladderWaveChance) return 'ladder';
+    if (this.wave >= TUNING.bomberUnlockWave && this.random.next() < TUNING.bomberWaveChance) return 'bomber';
+    if (this.wave >= TUNING.ladderUnlockWave && this.random.next() < TUNING.ladderWaveChance) return 'ladder';
     return 'grunt';
   }
 
   private spawnEnemy(kind: EnemyKind) {
     if (!this.core) return;
-    const angle = Math.random() * Math.PI * 2;
-    const radius = GRID_HALF + 7 + Math.random() * 4;
+    const angle = this.random.next() * Math.PI * 2;
+    const radius = GRID_HALF + 7 + this.random.next() * 4;
     const x = Math.cos(angle) * radius;
     const z = Math.sin(angle) * radius;
     const group = new THREE.Group();
@@ -450,11 +641,16 @@ class VoxelSiege {
     group.position.set(x, 0, z);
     this.scene.add(group);
     const health = kind === 'bomber' ? 30 : kind === 'ladder' ? 48 : TUNING.enemyHealth;
-    this.enemies.push({ id: this.nextId++, kind, x, z, height: 0, health, maxHealth: health, attackTimer: 0, ladderTimer: 0, path: [], pathIndex: 0, mesh: group });
+    const id = this.nextId++;
+    this.enemies.push({ id, kind, x, z, height: 0, previousX: x, previousZ: z, previousHeight: 0, health, maxHealth: health, attackTimer: 0, ladderTimer: 0, path: [], pathIndex: 0 });
+    this.enemyMeshes.set(id, group);
   }
 
   private updateEnemy(enemy: Enemy, dt: number) {
     if (this.phase !== 'wave' || !this.core) return;
+    enemy.previousX = enemy.x;
+    enemy.previousZ = enemy.z;
+    enemy.previousHeight = enemy.height;
     enemy.attackTimer -= dt;
     const current = { x: Math.round(enemy.x), z: Math.round(enemy.z) };
     const path = this.findPath(current, enemy.kind);
@@ -481,7 +677,8 @@ class VoxelSiege {
       if (this.coreHealth <= 0) { this.coreHealth = 0; this.phase = 'defeat'; this.showDefeat(); }
       this.syncUi();
     }
-    if (enemy.mesh) { enemy.mesh.position.set(enemy.x, enemy.height, enemy.z); enemy.mesh.rotation.y = Math.atan2(this.core.cell.x - enemy.x, this.core.cell.z - enemy.z); }
+    const mesh = this.enemyMeshes.get(enemy.id);
+    if (mesh) { mesh.position.set(enemy.x, enemy.height, enemy.z); mesh.rotation.y = Math.atan2(this.core.cell.x - enemy.x, this.core.cell.z - enemy.z); }
   }
 
   private findPath(start: GridPos, kind: EnemyKind): GridPos[] {
@@ -538,6 +735,7 @@ class VoxelSiege {
     }
     const damage = enemy.kind === 'bomber' ? TUNING.bombDamage : TUNING.gruntDamage;
     target.health -= damage;
+    this.refreshStructureDamage(target);
     enemy.attackTimer = enemy.kind === 'bomber' ? TUNING.bombAttackSeconds : TUNING.gruntAttackSeconds;
     if (enemy.kind === 'bomber') this.applyBlast(target.cell, damage * 0.35);
     if (target.health <= 0) this.destroyStructure(target);
@@ -568,7 +766,12 @@ class VoxelSiege {
 
   private applyBlast(cell: Cell, damage: number) {
     const affected = [...this.structures.values()].filter((item) => Math.hypot(item.cell.x - cell.x, item.cell.z - cell.z) <= 1.5 && item.kind !== 'throne' && item.kind !== 'steel');
-    for (const item of affected) { item.health -= damage; if (item.health <= 0) this.destroyStructure(item); }
+    for (const item of affected) {
+      if (this.structures.get(structureKey(item.cell.x, item.cell.y, item.cell.z)) !== item) continue;
+      item.health -= damage;
+      this.refreshStructureDamage(item);
+      if (item.health <= 0) this.destroyStructure(item);
+    }
   }
 
   private destroyStructure(item: Structure) {
@@ -577,12 +780,47 @@ class VoxelSiege {
     this.routeCache.clear();
     this.structureMeshes.delete(item.id);
     if (item.mesh) this.scene.remove(item.mesh);
-    for (let y = item.cell.y + 1; y < 32; y++) {
-      const above = this.structures.get(structureKey(item.cell.x, y, item.cell.z));
-      if (!above || above.kind === 'throne') break;
-      this.dropBlock(above);
+    const fallen = this.dropUnsupportedStructures();
+    this.showToast(fallen ? `${this.label(item.kind)} destroyed; ${fallen} unsupported ${fallen === 1 ? 'block fell' : 'blocks fell'}.` : `${this.label(item.kind)} destroyed.`);
+  }
+
+  private dropUnsupportedStructures() {
+    const supported = new Set<string>();
+    const queue: Cell[] = [];
+    for (const item of this.structures.values()) {
+      if (item.cell.y === 0) {
+        const key = structureKey(item.cell.x, item.cell.y, item.cell.z);
+        supported.add(key);
+        queue.push(item.cell);
+      }
     }
-    this.showToast(`${this.label(item.kind)} destroyed.`);
+
+    const neighbors = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    while (queue.length) {
+      const cell = queue.shift()!;
+      for (const [dx, dy, dz] of neighbors) {
+        const key = structureKey(cell.x + dx, cell.y + dy, cell.z + dz);
+        if (supported.has(key)) continue;
+        const neighbor = this.structures.get(key);
+        if (!neighbor) continue;
+        supported.add(key);
+        queue.push(neighbor.cell);
+      }
+    }
+
+    const unsupported = [...this.structures.values()].filter((item) => !supported.has(structureKey(item.cell.x, item.cell.y, item.cell.z)));
+    for (const item of unsupported) {
+      this.structures.delete(structureKey(item.cell.x, item.cell.y, item.cell.z));
+      this.structureMeshes.delete(item.id);
+      if (item.mesh) this.scene.remove(item.mesh);
+      this.dropBlock(item);
+    }
+    this.rebuildMaterialBatches();
+    if (unsupported.length) {
+      this.layoutVersion++;
+      this.routeCache.clear();
+    }
+    return unsupported.length;
   }
 
   private dropBlock(item: Structure) {
@@ -602,7 +840,9 @@ class VoxelSiege {
       const timer = Math.max(0, (this.towerTimers.get(tower.id) ?? 0) - dt);
       this.towerTimers.set(tower.id, timer);
       if (timer > 0) continue;
-      const target = this.enemies.find((enemy) => Math.hypot(enemy.x - tower.cell.x, enemy.z - tower.cell.z) <= TUNING.towerRange);
+      const target = this.enemies
+        .filter((enemy) => Math.hypot(enemy.x - tower.cell.x, enemy.z - tower.cell.z) <= TUNING.towerRange && this.hasLineOfSight(tower, enemy))
+        .sort((a, b) => Math.hypot(a.x - tower.cell.x, a.z - tower.cell.z) - Math.hypot(b.x - tower.cell.x, b.z - tower.cell.z))[0];
       if (!target) continue;
       const splash = tower.kind === 'splash';
       const start = new THREE.Vector3(tower.cell.x, tower.cell.y + 0.8, tower.cell.z);
@@ -612,6 +852,31 @@ class VoxelSiege {
       this.projectiles.push({ mesh: bolt, from: start, to: end, life: 0.22, maxLife: 0.22, damage: splash ? TUNING.splashDamage : TUNING.singleDamage, targetId: target.id, splash });
       this.towerTimers.set(tower.id, splash ? TUNING.splashFireSeconds : TUNING.singleFireSeconds);
     }
+  }
+
+  private hasLineOfSight(tower: Structure, enemy: Enemy) {
+    const startX = tower.cell.x;
+    const startZ = tower.cell.z;
+    const dx = enemy.x - startX;
+    const dz = enemy.z - startZ;
+    const distance = Math.hypot(dx, dz);
+    const samples = Math.ceil(distance * 4);
+    const startY = tower.cell.y + 0.8;
+    const endY = enemy.height + 0.3;
+
+    for (let i = 1; i < samples; i++) {
+      const t = i / samples;
+      const x = Math.round(startX + dx * t);
+      const z = Math.round(startZ + dz * t);
+      if (x === tower.cell.x && z === tower.cell.z) continue;
+      const rayY = startY + (endY - startY) * t;
+      for (const y of [Math.floor(rayY), Math.floor(rayY) - 1]) {
+        if (y < 0 || y >= 32) continue;
+        const blocker = this.structures.get(structureKey(x, y, z));
+        if (blocker && rayY > y + 0.02 && rayY < y + 0.98) return false;
+      }
+    }
+    return true;
   }
 
   private updateProjectiles(dt: number) {
@@ -633,7 +898,9 @@ class VoxelSiege {
   private damageEnemy(enemy: Enemy, damage: number) {
     enemy.health -= damage;
     if (enemy.health > 0) return;
-    if (enemy.mesh) this.scene.remove(enemy.mesh);
+    const mesh = this.enemyMeshes.get(enemy.id);
+    if (mesh) this.scene.remove(mesh);
+    this.enemyMeshes.delete(enemy.id);
     this.enemies.splice(this.enemies.indexOf(enemy), 1);
     this.gold += enemy.kind === 'bomber' ? TUNING.goldPerBomber : enemy.kind === 'ladder' ? TUNING.goldPerLadderSquad : TUNING.goldPerGrunt;
     this.syncUi();
@@ -641,7 +908,7 @@ class VoxelSiege {
 
   private updateDebris(dt: number) {
     if (!this.debris.size) return;
-    this.physics.timestep = Math.min(dt, 1 / 30);
+    this.physics.timestep = dt;
     this.physics.step();
     for (const [id, item] of [...this.debris]) {
       const pos = item.body.translation();
@@ -664,9 +931,15 @@ class VoxelSiege {
       item.structure.mesh = item.structure.mesh ?? this.createStructureMesh(item.structure);
       item.structure.mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
       item.structure.mesh.position.set(x, y + 0.5, z);
-      this.scene.add(item.structure.mesh);
       this.structures.set(structureKey(x, y, z), item.structure);
-      this.structureMeshes.set(id, item.structure.mesh);
+      if (this.isMaterial(item.structure.kind)) {
+        this.scene.remove(item.structure.mesh);
+        item.structure.mesh = undefined;
+        this.rebuildMaterialBatches();
+      } else {
+        this.scene.add(item.structure.mesh);
+        this.structureMeshes.set(id, item.structure.mesh);
+      }
       this.layoutVersion++;
       this.routeCache.clear();
       this.physics.removeRigidBody(item.body);
@@ -680,6 +953,7 @@ class VoxelSiege {
     document.querySelector('#final-wave')!.textContent = `Wave ${String(this.wave).padStart(2, '0')} reached`;
     this.ui.overlay!.style.display = 'grid';
     this.syncUi();
+    this.saveCheckpoint();
   }
 
   private syncUi() {
@@ -718,18 +992,32 @@ class VoxelSiege {
   private animate = () => {
     requestAnimationFrame(this.animate);
     const now = performance.now();
-    const dt = Math.min((now - this.lastFrame) / 1000, 0.05);
+    const frameDelta = Math.min((now - this.lastFrame) / 1000, MAX_FRAME_DELTA);
     this.lastFrame = now;
-    this.elapsed += dt;
+    this.elapsed += frameDelta;
     const fogMaterial = (this as unknown as { fogMaterial?: THREE.ShaderMaterial }).fogMaterial;
     if (fogMaterial) fogMaterial.uniforms.time.value = this.elapsed;
     this.controls.update();
-    if (this.phase === 'wave') {
-      this.updateWave(dt);
-      this.updateTowers(dt);
-      this.updateProjectiles(dt);
+    this.simulationAccumulator += frameDelta;
+    while (this.simulationAccumulator >= SIMULATION_STEP) {
+      if (this.phase === 'wave') {
+        this.updateWave(SIMULATION_STEP);
+        this.updateTowers(SIMULATION_STEP);
+        this.updateProjectiles(SIMULATION_STEP);
+      }
+      this.updateDebris(SIMULATION_STEP);
+      this.simulationAccumulator -= SIMULATION_STEP;
     }
-    this.updateDebris(dt);
+    const interpolation = this.simulationAccumulator / SIMULATION_STEP;
+    for (const enemy of this.enemies) {
+      const mesh = this.enemyMeshes.get(enemy.id);
+      if (!mesh) continue;
+      mesh.position.set(
+        enemy.previousX + (enemy.x - enemy.previousX) * interpolation,
+        enemy.previousHeight + (enemy.height - enemy.previousHeight) * interpolation,
+        enemy.previousZ + (enemy.z - enemy.previousZ) * interpolation,
+      );
+    }
     this.renderer.render(this.scene, this.camera);
   };
 }
