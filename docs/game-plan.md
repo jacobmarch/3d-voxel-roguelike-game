@@ -56,7 +56,7 @@ The first wave should be simple and readable. Additional enemy behavior, wave mi
 
 ### Runtime and libraries
 
-- **Vite** builds the browser application as static assets.
+- **Bun 1.4.2** is the pinned package manager and script runner; **Vite** builds the browser application as static assets.
 - **TypeScript** holds game rules, state models, input actions, and tuning definitions.
 - **Three.js** renders the 3D scene using WebGL 2.
 - **Rapier 3D** provides physics for falling and settling debris. The grid model, not the physics world, remains authoritative for intact castle pieces.
@@ -87,7 +87,7 @@ The first wave should be simple and readable. Additional enemy behavior, wave mi
 - Add versioned local save data in IndexedDB for the current run, settings, castle, rubble, gold, and wave.
 - Save at safe phase boundaries and support schema migration when the save structure changes.
 - Ship as static browser assets. Hosting provider selection is deferred; it should not affect game rules or save data.
-- Run state is stored in versioned IndexedDB records at safe phase boundaries and restored after reload.
+- Browser reload persistence is not part of the current first prototype slice.
 
 ## 4. Project organization
 
@@ -105,7 +105,7 @@ src/
   physics/           # Rapier world and dynamic debris lifecycle
   render/            # Three.js scene, voxel meshes, camera, effects
   ui/                 # DOM interface and input action bindings
-  save/               # versioned IndexedDB run checkpoints
+  save/               # versioned IndexedDB persistence (later slice)
 ```
 
 The current branch is an early prototype and keeps most runtime behavior in `src/main.ts`. Split modules as each system becomes stable; avoid premature abstraction that slows the first playable loop.
@@ -167,7 +167,7 @@ The first playable slice should allow a player to:
 
 - The prototype currently uses a **28 x 28** grid. This is a provisional arena size, not a locked design.
 - All numeric values in `src/config.ts` are initial playtest settings, not final balance.
-- Collapse checks face-adjacent support paths from the ground and drops unsupported connected groups; material-specific support rules remain a refinement.
+- The current collapse implementation primarily handles vertical stacks; full support analysis for more complex connected structures remains a refinement.
 - Upgrade progression, save/load, broad environment customization, additional towers, and player-editable rule data are outside the first playable slice.
 - The first release targets desktop browsers. It is not tuned for mobile play, but future mobile work should be limited mainly to input mappings, layout, and performance profiles rather than changes to core simulation data.
 

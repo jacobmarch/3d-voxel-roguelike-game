@@ -2,6 +2,10 @@
   "name": "voxel-siege",
   "private": true,
   "version": "0.1.0",
+  "packageManager": "bun@1.4.2",
+  "engines": {
+    "bun": ">=1.4.2"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
